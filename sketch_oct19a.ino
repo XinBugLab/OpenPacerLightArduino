@@ -8,9 +8,9 @@ SoftwareSerial swSerial(swRX, swTX);
 
 // PWM led control
 const int ledPwmPin = 6;
-
 const int wlModePin = 7;
 const int addrDeviceID = 2;
+
 union DATA {
   short DeviceID;
   byte hex[2];
@@ -43,95 +43,167 @@ static inline bool shouldRespond(unsigned long mask) {
   return (mask & gDeviceID) == gDeviceID;
 }
 
-static inline void applyBrightness(int v) {
-  analogWrite(ledPwmPin, clamp255(v));
-}
+// Encapsulated LED controller to avoid global state
+class LedController {
+public:
+  /**
+   * @brief Construct a new Led Controller object.
+   * @param pin The PWM pin for the LED.
+   */
+  explicit LedController(int pin)
+    : pwmPin(pin), phase(LED_IDLE), target(0), current(0),
+      phaseStart(0), fadeIn(0), hold(0), fadeOut(0) {}
+
+  /**
+   * @brief Queues a new LED action (fade-in, hold, fade-out).
+   * @param targetVal Target brightness (0-255).
+   * @param fIn Fade-in duration in milliseconds.
+   * @param h Hold duration in milliseconds.
+   * @param fOut Fade-out duration in milliseconds.
+   */
+  void queueAction(int targetVal, unsigned long fIn, unsigned long h, unsigned long fOut) {
+    target = (uint8_t)clamp255(targetVal);
+    fadeIn = fIn;
+    hold = h;
+    fadeOut = fOut;
+    phase = LED_FADE_IN;
+    phaseStart = millis();
+  }
+
+  /**
+   * @brief Updates the LED state machine. Should be called in the main loop.
+   */
+  void update() {
+    unsigned long now = millis();
+    switch (phase) {
+      case LED_IDLE:
+        // keep current brightness
+        break;
+      case LED_FADE_IN: {
+        if (phaseComplete(now, fadeIn)) {
+          transitionTo(LED_HOLD, target, now);
+          break;
+        }
+        float progress = progressOf(now, fadeIn);
+        int value = lerpRounded(0, target, progress);
+        current = (uint8_t)clamp255(value);
+        applyBrightnessLocal(current);
+        break;
+      }
+      case LED_HOLD: {
+        // ensure brightness stays at target
+        applyBrightnessLocal(target);
+        if (phaseComplete(now, hold)) {
+          beginPhase(LED_FADE_OUT, now);
+        }
+        break;
+      }
+      case LED_FADE_OUT: {
+        if (phaseComplete(now, fadeOut)) {
+          transitionTo(LED_IDLE, 0, now);
+          break;
+        }
+        float progress = progressOf(now, fadeOut);
+        int value = lerpRounded(target, 0, progress);
+        current = (uint8_t)clamp255(value);
+        applyBrightnessLocal(current);
+        break;
+      }
+    }
+  }
+
+private:
+  enum LedPhase { LED_IDLE, LED_FADE_IN, LED_HOLD, LED_FADE_OUT };
+
+  int pwmPin;
+  LedPhase phase;
+  uint8_t target;
+  uint8_t current;
+  unsigned long phaseStart;
+  unsigned long fadeIn;
+  unsigned long hold;
+  unsigned long fadeOut;
+
+  /**
+   * @brief Linearly interpolates between two values and rounds to the nearest integer.
+   * @param start The start value.
+   * @param end The end value.
+   * @param t The interpolation progress (0.0 to 1.0).
+   * @return The interpolated and rounded value.
+   */
+  static inline int lerpRounded(int start, int end, float t) {
+    float v = start + t * (end - start);
+    return (int)(v + 0.5f);
+  }
+
+  /**
+   * @brief Applies a brightness value to the LED.
+   * @param v The brightness value (0-255).
+   */
+  inline void applyBrightnessLocal(int v) {
+    analogWrite(pwmPin, clamp255(v));
+  }
+
+  /**
+   * @brief Checks if the current phase is complete.
+   * @param now The current time from millis().
+   * @param duration The duration of the phase.
+   * @return True if the phase is complete, false otherwise.
+   */
+  inline bool phaseComplete(unsigned long now, unsigned long duration) {
+    return (duration == 0) || ((now - phaseStart) >= duration);
+  }
+
+  /**
+   * @brief Begins a new phase.
+   * @param next The next phase to transition to.
+   * @param now The current time from millis().
+   */
+  inline void beginPhase(LedPhase next, unsigned long now) {
+    phase = next;
+    phaseStart = now;
+  }
+
+  /**
+   * @brief Transitions to a new phase with a specific brightness.
+   * @param next The next phase.
+   * @param brightness The brightness to set.
+   * @param now The current time from millis().
+   */
+  inline void transitionTo(LedPhase next, uint8_t brightness, unsigned long now) {
+    current = brightness;
+    applyBrightnessLocal(brightness);
+    beginPhase(next, now);
+  }
+
+  /**
+   * @brief Calculates the progress of the current phase.
+   * @param now The current time from millis().
+   * @param duration The total duration of the phase.
+   * @return The progress as a float from 0.0 to 1.0.
+   */
+  inline float progressOf(unsigned long now, unsigned long duration) {
+    if (duration == 0) return 1.0f;
+    unsigned long elapsed = now - phaseStart;
+    float t = (float)elapsed / (float)duration;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+  }
+};
+
+// Single controller instance
+static LedController gLed(ledPwmPin);
 
 // opcode constants (3-bit opcode in highest bits of id_mask)
 const uint8_t OPCODE_LIGHT = 0;   // 0b000: light control
 const uint8_t OPCODE_SET_ID = 1;  // 0b001: set device id (single packet)
 const int KEY_SET_ID = 165;       // simple key to guard ID setting (0xA5)
 
-// LED fade/hold state machine
-enum LedPhase { LED_IDLE, LED_FADE_IN, LED_HOLD, LED_FADE_OUT };
-LedPhase ledPhase = LED_IDLE;
-uint8_t ledTarget = 0;
-uint8_t ledCurrent = 0;
-unsigned long msPhaseStart = 0;
-unsigned long msFadeIn = 0;
-unsigned long msHold = 0;
-unsigned long msFadeOut = 0;
-
-void queueLedAction(int target, unsigned long fadeIn, unsigned long hold, unsigned long fadeOut) {
-  ledTarget = (uint8_t)clamp255(target);
-  msFadeIn = fadeIn;
-  msHold = hold;
-  msFadeOut = fadeOut;
-  ledPhase = LED_FADE_IN;
-  msPhaseStart = millis();
-}
-
-void updateLed() {
-  unsigned long now = millis();
-  switch (ledPhase) {
-    case LED_IDLE:
-      // keep current brightness
-      break;
-    case LED_FADE_IN: {
-      if (msFadeIn == 0) {
-        ledCurrent = ledTarget;
-        applyBrightness(ledCurrent);
-        ledPhase = LED_HOLD;
-        msPhaseStart = now;
-        break;
-      }
-      unsigned long elapsed = now - msPhaseStart;
-      if (elapsed >= msFadeIn) {
-        ledCurrent = ledTarget;
-        applyBrightness(ledCurrent);
-        ledPhase = LED_HOLD;
-        msPhaseStart = now;
-        break;
-      }
-      float progress = (float)elapsed / (float)msFadeIn;
-      int value = (int)(progress * ledTarget + 0.5f);
-      ledCurrent = (uint8_t)clamp255(value);
-      applyBrightness(ledCurrent);
-      break;
-    }
-    case LED_HOLD: {
-      // ensure brightness stays at target
-      applyBrightness(ledTarget);
-      if (msHold == 0 || (now - msPhaseStart) >= msHold) {
-        ledPhase = LED_FADE_OUT;
-        msPhaseStart = now;
-      }
-      break;
-    }
-    case LED_FADE_OUT: {
-      if (msFadeOut == 0) {
-        ledCurrent = 0;
-        applyBrightness(0);
-        ledPhase = LED_IDLE;
-        break;
-      }
-      unsigned long elapsed = now - msPhaseStart;
-      if (elapsed >= msFadeOut) {
-        ledCurrent = 0;
-        applyBrightness(0);
-        ledPhase = LED_IDLE;
-        break;
-      }
-      float progress = (float)elapsed / (float)msFadeOut;
-      int value = (int)((1.0f - progress) * ledTarget + 0.5f);
-      ledCurrent = (uint8_t)clamp255(value);
-      applyBrightness(ledCurrent);
-      break;
-    }
-  }
-}
-
-// Process one complete command line
+/**
+ * @brief Process one complete command line.
+ * @param line The command line string to process.
+ */
 void processCommandLine(const String &line) {
   Command cmd; String err;
   if (parseCommandString(line, cmd, err)) {
@@ -146,7 +218,7 @@ void processCommandLine(const String &line) {
         bool match = (target == my) || ((target & my) == my) || (target == 0x1FFF);
         if (match) {
           int b = clamp255(cmd.brightness);
-          queueLedAction(b, (unsigned long)cmd.fade_in, (unsigned long)cmd.hold, (unsigned long)cmd.fade_out);
+          gLed.queueAction(b, (unsigned long)cmd.fade_in, (unsigned long)cmd.hold, (unsigned long)cmd.fade_out);
         }
         break;
       }
@@ -173,8 +245,13 @@ void processCommandLine(const String &line) {
   }
 }
 
-// Parse a comma-separated command string according to the given logic
-// Returns true on success, false on failure with error message populated
+/**
+ * @brief Parse a comma-separated command string.
+ * @param command_string The string to parse.
+ * @param out The Command struct to populate.
+ * @param error An error message if parsing fails.
+ * @return True on success, false on failure.
+ */
 bool parseCommandString(const String &command_string, Command &out, String &error) {
   // Split by comma into exactly 5 parts
   String parts[5];
@@ -221,6 +298,9 @@ bool parseCommandString(const String &command_string, Command &out, String &erro
   return true;
 }
 
+/**
+ * @brief Initializes the hardware and serial communication.
+ */
 void setup() {
   pinMode(ledPwmPin, OUTPUT);
   pinMode(wlModePin, OUTPUT);
@@ -250,6 +330,9 @@ void setup() {
   // Minimal startup: avoid verbose serial logs
 }
 
+/**
+ * @brief Main loop: handles serial communication and updates the LED.
+ */
 void loop() {
   if(Serial.available()) {
     swSerial.write(Serial.read());
@@ -268,8 +351,6 @@ void loop() {
         continue;
       }
 
-      // No WHOAMI command; only handle control commands
-
       // 处理命令行
       processCommandLine(line);
     } else {
@@ -282,6 +363,6 @@ void loop() {
     }
   }
 
-  // LED
-  updateLed();
+  // Update LED state
+  gLed.update();
 }
